@@ -1,0 +1,129 @@
+# Ô kiểm 5 (2026-11-25): bảng DAX chưa dịch, bảng điền tay có phân quyền, hàm tính theo ô.
+# Chỉ in mã và số: không in tên báo cáo, bảng, cột hay dòng nào. Không gọi model, không ghi gì.
+import dataclasses
+from collections import Counter, defaultdict
+
+from chatbot.config import load_agent_config
+from chatbot.formula import face
+from chatbot.formula import locate as loc
+from chatbot.formula.sql_plan import sql_plan
+from chatbot.formula.tree import build_tree
+from chatbot.formula.visual_sql import field_measure
+from chatbot.knowledge import AllowedDivisions, KnowledgeSearch
+
+_EMAIL_HINTS = ("mail", "user", "upn", "login")  # cột có tên giống email hay tài khoản
+
+
+def _input_status(report, table):
+    entry = {k.casefold(): v for k, v in report.table_sql.items()}.get(table.casefold())
+    if entry is None:
+        source = {k.casefold(): v for k, v in report.sources.items()}.get(table.casefold())
+        return f"không có dòng SQL ({source.kind if source else 'không rõ'})"
+    if entry.level == "full":
+        return "có SQL đủ"
+    return f"dừng {entry.stop or '-'}"
+
+
+def kiem5(reports, max_tokens):
+    dax = {}  # (báo cáo, bảng) -> dòng SQL của bảng DAX chưa dịch
+    rls = {}  # (báo cáo, bảng) -> dòng SQL của bảng điền tay có phân quyền
+    for report in reports:
+        for entry in report.table_sql.values():
+            key = (report.report_id, entry.pbi_table.casefold())
+            if entry.dax_function is not None and entry.level == "pbi":
+                dax[key] = (report, entry)
+            if entry.stop == "inline_rls":
+                rls[key] = (report, entry)
+    dax_trees, rls_trees = Counter(), Counter()
+    rls_with_cols, rls_cols, rls_hint_cols = Counter(), defaultdict(set), defaultdict(set)
+    ctx_trees = ctx_tiles = trees = 0
+    ctx_names, ctx_plans, ctx_tile_keys = Counter(), Counter(), set()
+    for report in reports:
+        for page in report.pages:
+            for tile in face.number_tiles(page):
+                if tile.layout is None:
+                    continue
+                for field in tile.fields:
+                    measure_name = field_measure(report, field)
+                    if measure_name is None:
+                        continue
+                    target = loc.FormulaTarget(
+                        report_id=report.report_id,
+                        measure_name=measure_name,
+                        calc_item=None,
+                        page_id=page.page_id,
+                        visual_id=tile.visual_id,
+                        chart_choices=(),
+                        found_by="image",
+                        image_text=None,
+                    )
+                    try:
+                        tree = build_tree(
+                            report, target, question="", image_text=None, max_tokens=max_tokens
+                        )
+                    except ValueError:
+                        continue
+                    trees += 1
+                    for supply in tree.supply:
+                        key = (report.report_id, supply.table.casefold())
+                        if key in dax:
+                            dax_trees[key] += 1
+                        if key in rls:
+                            rls_trees[key] += 1
+                            rls_with_cols[key] += bool(supply.columns)
+                            for column, _type in supply.columns:
+                                rls_cols[key].add(column.casefold())
+                                if any(h in column.casefold() for h in _EMAIL_HINTS):
+                                    rls_hint_cols[key].add(column.casefold())
+                    names = {
+                        u.detail.upper()
+                        for level in tree.levels
+                        for u in level.untranslatable
+                        if u.code == "context_function"
+                    }
+                    if names:
+                        ctx_trees += 1
+                        ctx_names.update(names)
+                        plan = sql_plan(tree)
+                        as_tile = any(c.policy == "as_tile" for c in plan.caveats)
+                        note = " (viết theo ô, cần kiểm)" if as_tile else ""
+                        ctx_plans[plan.status + note] += 1
+                        ctx_tile_keys.add((report.report_id, page.page_id, tile.visual_id))
+    ctx_tiles = len(ctx_tile_keys)
+    out = [f"Cây công thức dựng được (như ô 6): {trees}"]
+    out.append(f"K1. Bảng DAX chưa dịch: {len(dax)}")
+    order = sorted(dax, key=lambda k: -dax_trees[k])
+    for n, key in enumerate(order, 1):
+        report, entry = dax[key]
+        inputs = Counter(_input_status(report, t) for t in entry.built_from)
+        listed = " · ".join(f"{s} {c}" for s, c in inputs.most_common()) or "không đọc bảng nào"
+        out.append(
+            f"  D{n}: {entry.stop}:{entry.stop_detail or '-'}:{entry.dax_function} · "
+            f"cây cần bảng này {dax_trees[key]} · bảng đầu vào {len(entry.built_from)}: {listed}"
+        )
+    names = Counter(key[1] for key in rls)
+    out.append(
+        f"K2. Bảng điền tay có phân quyền: {len(rls)} (theo báo cáo) · tên khác nhau {len(names)}"
+        f" · cùng tên ở nhiều báo cáo {sum(1 for c in names.values() if c > 1)}"
+    )
+    for n, key in enumerate(sorted(rls, key=lambda k: -rls_trees[k]), 1):
+        out.append(
+            f"  R{n}: cây cần bảng này {rls_trees[key]} · trong đó lấy cột của bảng "
+            f"{rls_with_cols[key]} · chỉ nằm trên đường nối {rls_trees[key] - rls_with_cols[key]}"
+            f" · số cột được dùng {len(rls_cols[key])} · cột tên giống email/tài khoản "
+            f"{len(rls_hint_cols[key])}"
+        )
+    plans = " · ".join(f"{s} {c}" for s, c in ctx_plans.most_common()) or "-"
+    funcs = " · ".join(f"{s} {c}" for s, c in ctx_names.most_common()) or "-"
+    out.append(f"K3. Hàm tính theo ô: cây {ctx_trees} · ô {ctx_tiles} · SQL: {plans}")
+    out.append(f"  theo hàm (số cây): {funcs}")
+    return out
+
+
+if __name__ == "__main__":
+    _config = load_agent_config()
+    _search = KnowledgeSearch.from_config(
+        dataclasses.replace(_config.retrieval, refresh_seconds=0)
+    )
+    _reports = _search.formula_reports(AllowedDivisions.parse(DIVISIONS))
+    print("\n".join(kiem5(_reports, _config.formula_tree_max_tokens)))
